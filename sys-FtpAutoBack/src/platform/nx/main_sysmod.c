@@ -1544,20 +1544,87 @@ static void create_game_folder(u64 tid) {
 
     log_file_fwrite("准备创建游戏文件夹 %s", folder_name);
     
-    const char* username = g_current_game_user_name[0] ? g_current_game_user_name : "Unknown";
-
-    // 创建游戏名称文件夹路径，添加路径长度检查
-    char game_folder_path[256] = {0};  // 增加缓冲区大小
-    int path_len = snprintf(game_folder_path, sizeof(game_folder_path), "%s/%s/%s", AUTOBACK_DIR_PATH, username, folder_name);
-
-    // 使用递归创建，会依次创建每一级目录
-    Result mkdir_rc = createDirectory(game_folder_path);
-    if (R_SUCCEEDED(mkdir_rc)) {
-        log_file_fwrite("已成功创建游戏文件夹: %s", game_folder_path);
-    } else {
-        log_file_fwrite("警告: 无法创建游戏文件夹 %s: 0x%x", game_folder_path, mkdir_rc);
+    FsFileSystem* sdmc_fs = fsdev_wrapGetDeviceFileSystem("sdmc");
+    if (sdmc_fs == NULL) {
+        log_file_write("警告: 无法获取 SD 卡文件系统，无法创建游戏文件夹");
+        return;
     }
-
+    
+    // 遍历全部用户名，在autoback文件夹内生成游戏名称文件夹
+    AccountUid user_ids[ACC_USER_LIST_SIZE] = {0};
+    s32 total_users = 0;
+    Result account_rc = accountGetUserCount(&total_users);
+    if (R_SUCCEEDED(account_rc) && total_users > 0) {
+        account_rc = accountListAllUsers(user_ids, ACC_USER_LIST_SIZE, &total_users);
+        if (R_SUCCEEDED(account_rc)) {
+            for (s32 i = 0; i < total_users; i++) {
+                AccountProfile profile = {0};
+                AccountUserData user_data = {0};
+                AccountProfileBase profile_base = {0};
+                
+                account_rc = accountGetProfile(&profile, user_ids[i]);
+                if (R_SUCCEEDED(account_rc)) {
+                    account_rc = accountProfileGet(&profile, &user_data, &profile_base);
+                    if (R_SUCCEEDED(account_rc)) {
+                        char username[33] = {0}; // AccountProfileBase nickname is 32 chars + null terminator
+                        
+                        // 安全地复制和验证用户名
+                        if (profile_base.nickname[0] != '\0') {
+                            strncpy(username, profile_base.nickname, sizeof(username) - 1);
+                            username[sizeof(username) - 1] = '\0';
+                            
+                            // 清理用户名中的特殊字符
+                            sanitize_filename(username);
+                            
+                            // 验证清理后的用户名是否有效
+                            if (strlen(username) == 0) {
+                                snprintf(username, sizeof(username), "User_%016lX", user_ids[i].uid[0]);
+                            }
+                        } else {
+                            // 如果nickname为空，使用UID作为用户名
+                            snprintf(username, sizeof(username), "User_%016lX", user_ids[i].uid[0]);
+                        }
+                        
+                        // 创建游戏名称文件夹路径，添加路径长度检查
+                        char game_folder_path[256] = {0};  // 增加缓冲区大小
+                        int path_len = snprintf(game_folder_path, sizeof(game_folder_path), "%s/%s/%s", AUTOBACK_DIR_PATH, username, folder_name);
+                        
+                        // 检查路径长度是否超出限制
+                        if (path_len >= sizeof(game_folder_path)) {
+                            char log_buf[512] = {0};
+                            snprintf(log_buf, sizeof(log_buf), "警告: 用户名 %s, 游戏 %s 的路径长度超出限制，无法创建文件夹", username, folder_name);
+                            log_file_write(log_buf);
+                            accountProfileClose(&profile);
+                            continue;
+                        }
+                        
+                        // 创建游戏名称文件夹
+                        Result mkdir_rc = fsFsCreateDirectory(sdmc_fs, game_folder_path);
+                        if (R_SUCCEEDED(mkdir_rc)) {
+                            char log_buf[512] = {0};
+                            snprintf(log_buf, sizeof(log_buf), "已成功创建游戏文件夹: %s", game_folder_path);
+                            log_file_write(log_buf);
+                        } else if (mkdir_rc == 0x402) { // FSERROR_PATH_ALREADY_EXISTS
+                            // 文件夹已存在，不需要处理
+                        } else {
+                            char log_buf[512] = {0};
+                            snprintf(log_buf, sizeof(log_buf), "警告: 无法创建游戏文件夹 %s: 0x%x", game_folder_path, mkdir_rc);
+                            log_file_write(log_buf);
+                        }
+                    } else {
+                        char log_buf[256] = {0};
+                        snprintf(log_buf, sizeof(log_buf), "警告: 无法获取用户 %016lX 的配置文件数据: 0x%x", user_ids[i].uid[0], account_rc);
+                        log_file_write(log_buf);
+                    }
+                    accountProfileClose(&profile);
+                } else {
+                    char log_buf[256] = {0};
+                    snprintf(log_buf, sizeof(log_buf), "警告: 无法获取用户 %016lX 的配置文件: 0x%x", user_ids[i].uid[0], account_rc);
+                    log_file_write(log_buf);
+                }
+            }
+        }
+    }
 }
 
 static void generate_save_archive(u64 tid) {
@@ -1692,10 +1759,10 @@ static void generate_save_archive(u64 tid) {
                             }
                         }
 
-                        // 使用get_app_name获取游戏名
+                        // 使用get_app_log_name获取游戏名
                         NcmContentId content_id = {0};
                         struct AppName app_name = {0};
-                        get_app_name(tid, &content_id, &app_name);
+                        get_app_log_name(tid, &content_id, &app_name);
 
                         if (R_SUCCEEDED(rc)) {
                             log_file_fwrite("已成功创建用户 %s 的存档元数据: %s", username, final_path);
@@ -2672,7 +2739,23 @@ static bool webdav_handshake(void) {
         }
         
         log_file_write(debug_buf);
-
+        
+        // 设置响应数据处理回调函数（修复崩溃问题）
+        struct WebDAVResponseData response_data;
+        response_data.data = malloc(1);
+        if (!response_data.data) {
+            snprintf(debug_buf, sizeof(debug_buf), "Failed to allocate memory for response data");
+            log_file_write(debug_buf);
+            curl_slist_free_all(headers);
+            curl_easy_cleanup(curl);
+            return false;
+        }
+        response_data.data[0] = '\0';
+        response_data.size = 0;
+        
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, webdav_response_write_callback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_data);
+        
         snprintf(debug_buf, sizeof(debug_buf), "libcurl configuration completed");
         log_file_write(debug_buf);
         
@@ -2698,6 +2781,11 @@ static bool webdav_handshake(void) {
         log_file_write(debug_buf);
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
+        
+        // 释放响应数据内存
+        if (response_data.data) {
+            free(response_data.data);
+        }
     } else {
         snprintf(debug_buf, sizeof(debug_buf), "Failed to initialize curl");
         log_file_write(debug_buf);
@@ -3315,7 +3403,7 @@ static Result stream_zip_to_webdav(const char* local_zip_path, u64 tid, AccountU
         create_ultrahand_notification("无法获取时间，备份上传失败", 1);
         NcmContentId content_id = {0};
         struct AppName app_name = {0};
-        get_app_name(tid, &content_id, &app_name);
+        get_app_log_name(tid, &content_id, &app_name);
         backuplog_fwrite("云端备份失败，仅备份至本地|%s|%s|0000.00.00@00.00.00", app_name.str, username);
         return -1;
     } else {
@@ -3578,10 +3666,10 @@ static Result stream_zip_to_webdav(const char* local_zip_path, u64 tid, AccountU
         long http_code = 0;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
         
-        // 使用get_app_name获取游戏名
+        // 使用get_app_log_name获取游戏名
         NcmContentId content_id = {0};
         struct AppName app_name = {0};
-        get_app_name(tid, &content_id, &app_name);
+        get_app_log_name(tid, &content_id, &app_name);
 
         if (http_code == 201 || http_code == 200 || http_code == 204) {
             snprintf(debug_buf, sizeof(debug_buf), "WebDAV 上传成功: HTTP %ld, 已上传字节数: %lu", http_code, upload_data.total_uploaded);
