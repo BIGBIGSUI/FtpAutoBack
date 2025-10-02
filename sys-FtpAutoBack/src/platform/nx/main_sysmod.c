@@ -2672,32 +2672,35 @@ static bool webdav_handshake(void) {
         }
         
         log_file_write(debug_buf);
-
+        
+        // 设置响应数据处理回调函数（修复崩溃问题）
+        struct WebDAVResponseData response_data;
+        response_data.data = malloc(1);
+        if (!response_data.data) {
+            snprintf(debug_buf, sizeof(debug_buf), "Failed to allocate memory for response data");
+            log_file_write(debug_buf);
+            curl_slist_free_all(headers);
+            curl_easy_cleanup(curl);
+            return false;
+        }
+        response_data.data[0] = '\0';
+        response_data.size = 0;
+        
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, webdav_response_write_callback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_data);
+        
         snprintf(debug_buf, sizeof(debug_buf), "libcurl configuration completed");
         log_file_write(debug_buf);
-        
-        res = curl_easy_perform(curl);
-        if (res == CURLE_OK) {
-            long code = 0;
-            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-            snprintf(debug_buf, sizeof(debug_buf), "WebDAV PROPFIND completed: status code=%ld", code);
-            log_file_write(debug_buf);
-            handshake_success = true;
-        } else {
-            if (errbuf[0]) {
-                snprintf(debug_buf, sizeof(debug_buf), "WebDAV request failed: %d, %s", res, errbuf);
-                log_file_write(debug_buf);
-            } else {
-                snprintf(debug_buf, sizeof(debug_buf), "WebDAV request failed, error code: %d", res);
-                log_file_write(debug_buf);
-            }
-        }
 
-        // 清理资源
-        snprintf(debug_buf, sizeof(debug_buf), "Cleaning HTTP headers");
+@@ -2781,11 +2698,6 @@ static bool webdav_handshake(void) {
         log_file_write(debug_buf);
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
+        
+        // 释放响应数据内存
+        if (response_data.data) {
+            free(response_data.data);
+        }
     } else {
         snprintf(debug_buf, sizeof(debug_buf), "Failed to initialize curl");
         log_file_write(debug_buf);
